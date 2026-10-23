@@ -135,18 +135,31 @@ int parser(const char *input, char *argv[]) {
         return -1;
       }
     }
+    else if (escape_flag) {
+      if (single_quote == INSIDE) {
+        current_arg[arg_len++] = c;
+      }
+      else if (double_quote == INSIDE) {
+        if (c == '\\') {
+          current_arg[arg_len++] = c;
+        }
+        else if (c == '"') {
+          current_arg[arg_len++] = c;
+        }
+        else {
+          current_arg[arg_len++] = '\\';
+          current_arg[arg_len++] = c;
+        }
+      } else {
+        current_arg[arg_len++] = c;
+      }
+      escape_flag = 0;
+    }
     else if (c == '\\') {
-      if (double_quote == INSIDE && escape_flag == 0) {
-        escape_flag = 1;
-      }
-      else if (double_quote == INSIDE && escape_flag == 1) {
+      if (single_quote == INSIDE) {
         current_arg[arg_len++] = c;
         escape_flag = 0;
-      }
-      else if (escape_flag || single_quote == INSIDE) {
-        current_arg[arg_len++] = c;
-        escape_flag = 0;
-      }
+      } 
       else {
         escape_flag = 1;
         arg_started = 1;
