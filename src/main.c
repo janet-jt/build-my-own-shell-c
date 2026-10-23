@@ -9,8 +9,14 @@
 #include <sys/wait.h>
 #include <errno.h>
 
-#define INPUT_SIZE 1024
+#define INPUT_SIZE 2048
 #define MAX_ARGS 64
+#define MAX_ARG_LEN 128
+
+enum quote_state {
+  OUTSIDE,
+  INSIDE
+};
 
 typedef enum {
   BUILTIN_ECHO,
@@ -23,6 +29,7 @@ typedef enum {
 
 Builtin type_command(const char *cmd);
 
+int parser(const char *input, char *argv[]);
 void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
 void pwd_builtin();
@@ -30,46 +37,48 @@ void cd_builtin(const char *path);
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
 void run_program(char *argv[]);
+void free_argv(char *argv[]);
 
 
 int main(void) {
   setbuf(stdout, NULL);
   
   while (1) {  
+    int argc;
     char input[INPUT_SIZE];
-    char *argv[MAX_ARGS];
-    int argc = 0;
-    char *arg, *arg_ptr;
+    char *argv[MAX_ARGS + 1];
     printf("$ ");
     fflush(stdout);
 
     if (fgets(input, sizeof input, stdin) == NULL ) {
       break;
     }
-    
+        
     size_t len = strcspn(input, "\r\n");
     input[len] = '\0';
 
-    arg_ptr = input;
-    while ((arg = strsep(&arg_ptr, " ")) != NULL) {
-      if (*arg == '\0') {
-        continue;
-      }
-
-      if (argc < MAX_ARGS - 1) {
-        argv[argc++] = arg;
-      } else {
-        break;
-      }
+    argc = parser(input, argv);
+    // argv[argc] = NULL;
+    
+    if (argc >= MAX_ARGS) {
+      fprintf(stderr, "Error: Too many arguments (max %d).\n", MAX_ARGS);
+      continue;
     }
 
-    argv[argc] = NULL;
+    if (argc == 0) {
+      continue;
+    }
+
+    if (argc == -1) {
+      printf("> ");
+      continue;
+    }
 
     if (strncmp(argv[0], "exit" , 4) == 0) {
+      free_argv(argv);
       break;
     }
     else if (strncmp(argv[0], "echo" , 4) == 0) {
-      //Bug: when I use echo "xxx     yyy", cannot keep the spaces
       echo_builtin(argc, argv);
     }
     else if (strncmp(argv[0], "type" , 4) == 0) {
@@ -97,8 +106,113 @@ int main(void) {
     }
 
   }
-
+  
   return 0;
+}
+
+int parser(const char *input, char *argv[]) {
+  int arg_len = 0;
+  int argc = 0;
+  int arg_started = 0;
+  int escape_flag = 0;
+  enum quote_state single_quote = OUTSIDE;
+  enum quote_state double_quote = OUTSIDE;
+
+  char current_arg[MAX_ARG_LEN];
+
+  for(int i = 0; ; i++) {
+    char c = input[i];
+    if (c == '\0') {
+      if (single_quote == OUTSIDE && double_quote == OUTSIDE && escape_flag == 0) {
+        if (arg_started || arg_len > 0) {
+          current_arg[arg_len] = '\0';
+          argv[argc] = strdup(current_arg);
+          argc++;
+        }
+        break;
+      }
+      else {
+        return -1;
+      }
+    }
+    else if (c == '\\') {
+      if (double_quote == INSIDE && escape_flag == 0) {
+        escape_flag = 1;
+      }
+      else if (double_quote == INSIDE && escape_flag == 1) {
+        current_arg[arg_len++] = c;
+        escape_flag = 0;
+      }
+      else if (escape_flag || single_quote == INSIDE) {
+        current_arg[arg_len++] = c;
+        escape_flag = 0;
+      }
+      else {
+        escape_flag = 1;
+        arg_started = 1;
+      }
+    }
+    else if (c == ' ') {
+      if (arg_started) {
+        if (single_quote == INSIDE || double_quote == INSIDE || escape_flag) {
+          if (arg_len < MAX_ARG_LEN - 1) {
+              current_arg[arg_len++] = c;
+              escape_flag = 0;
+          }
+        }
+        else {
+          current_arg[arg_len] = '\0';
+          argv[argc] = strdup(current_arg);
+          arg_len = 0;
+          arg_started = 0;
+          argc++;
+        }
+      }
+    }
+    else {
+      if (c == '\'' && escape_flag == 0) {
+        if (single_quote == INSIDE && double_quote == OUTSIDE) {
+          single_quote = OUTSIDE;
+        } 
+        else if (single_quote == OUTSIDE && double_quote == OUTSIDE) {
+          single_quote = INSIDE;
+          arg_started = 1;
+        }
+        else {
+          if (arg_len < MAX_ARG_LEN - 1) {
+            current_arg[arg_len++] = c;
+          }
+          arg_started = 1;
+        }
+      } 
+      else if (c == '\"' && escape_flag == 0) {
+        if (single_quote == OUTSIDE && double_quote == INSIDE) {
+          double_quote = OUTSIDE;
+        } 
+        else if (single_quote == OUTSIDE && double_quote == OUTSIDE) {
+          double_quote = INSIDE;
+          arg_started = 1;
+        }
+        else {
+          if (arg_len < MAX_ARG_LEN - 1) {
+            current_arg[arg_len++] = c;
+          }
+          arg_started = 1;
+        }
+      }
+      else {
+        if (arg_len < MAX_ARG_LEN - 1) {
+            current_arg[arg_len++] = c;
+        }
+        arg_started = 1;
+        escape_flag = 0;
+      }
+    }
+  }
+  
+  argv[argc] = NULL;
+
+  return argc;
 }
 
 Builtin type_command(const char *cmd) {
@@ -274,4 +388,12 @@ void run_program(char *argv[]) {
     free(full_path);
   } 
   
+}
+
+
+void free_argv(char *argv[]) {
+  for (int i = 0; argv[i] != NULL; i++){
+    free(argv[i]);
+    argv[i] = NULL;
+  }
 }
