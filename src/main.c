@@ -8,15 +8,11 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #define INPUT_SIZE 2048
 #define MAX_ARGS 64
 #define MAX_ARG_LEN 128
-
-enum quote_state {
-  OUTSIDE,
-  INSIDE
-};
 
 typedef enum {
   BUILTIN_ECHO,
@@ -27,9 +23,39 @@ typedef enum {
   BUILTIN_UNKNOWN
 } Builtin;
 
-Builtin type_command(const char *cmd);
+typedef enum {
+  TOKEN_WORD,
+  TOKEN_STDOUT_REDIRECT,
+  TOKEN_STDERR_REDIRECT
+} TokenType;
 
-int parser(const char *input, char *argv[]);
+typedef struct {
+  TokenType type;
+  char *text;
+} Token;
+
+enum redirection_mode{
+  OVERWRITE,
+  APPEND
+};
+
+typedef struct {
+  int argc;
+  enum redirection_mode stdout_mode;
+  enum redirection_mode stderr_mode;
+  char *stdout_output_file;
+  char *stderr_output_file;
+  char *argv[MAX_ARGS + 1];
+} ParsedCommand;
+
+enum quote_state {
+  OUTSIDE,
+  INSIDE
+};
+
+Builtin type_command(const char *cmd);
+int tokenize(const char *input, Token tokens[], size_t capacity);
+int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command);
 void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
 void pwd_builtin();
@@ -37,28 +63,34 @@ void cd_builtin(const char *path);
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
 void run_program(char *argv[]);
-void free_argv(char *argv[]);
+int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection_mode stderr_redirect_mode, const char *stdout_output_file, const char *stderr_output_file);
+void free_tokens(Token tokens[], size_t token_count);
 
 
 int main(void) {
   setbuf(stdout, NULL);
   
   while (1) {  
-    int argc;
+    int argc, token_count;
     char input[INPUT_SIZE];
-    char *argv[MAX_ARGS + 1];
+    int stdout_fd = dup(STDOUT_FILENO);
+    int stderr_fd = dup(STDERR_FILENO);
+    
     printf("$ ");
     fflush(stdout);
 
     if (fgets(input, sizeof input, stdin) == NULL ) {
       break;
     }
-        
+
     size_t len = strcspn(input, "\r\n");
     input[len] = '\0';
 
-    argc = parser(input, argv);
-    // argv[argc] = NULL;
+    Token tokens[INPUT_SIZE];
+    ParsedCommand command;
+
+    token_count = tokenize(input, tokens, sizeof tokens / sizeof tokens[0]);  
+    argc = parse_token(tokens, (size_t)token_count, &command);
     
     if (argc >= MAX_ARGS) {
       fprintf(stderr, "Error: Too many arguments (max %d).\n", MAX_ARGS);
@@ -74,45 +106,58 @@ int main(void) {
       continue;
     }
 
-    if (strncmp(argv[0], "exit" , 4) == 0) {
-      free_argv(argv);
+    if (command.stdout_output_file != NULL || command.stderr_output_file != NULL) {
+      std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
+    }
+
+    if (strncmp(command.argv[0], "exit" , 4) == 0) {
+      free_tokens(tokens, token_count);
       break;
     }
-    else if (strncmp(argv[0], "echo" , 4) == 0) {
-      echo_builtin(argc, argv);
+    else if (strncmp(command.argv[0], "echo" , 4) == 0) {
+      echo_builtin(command.argc, command.argv);
     }
-    else if (strncmp(argv[0], "type" , 4) == 0) {
+    else if (strncmp(command.argv[0], "type" , 4) == 0) {
       if (argc == 1) {
         printf("usage: type command\n");
       } else {
-        type_builtin(argv[1]);
+        type_builtin(command.argv[1]);
       }
     }
-    else if (strncmp(argv[0], "pwd", 3) == 0) {
+    else if (strncmp(command.argv[0], "pwd", 3) == 0) {
       pwd_builtin();
     }
-    else if (strncmp(argv[0], "cd", 2) == 0) {
+    else if (strncmp(command.argv[0], "cd", 2) == 0) {
       if (argc > 2) {
         fprintf(stderr, "cd: too many arguments\n");
       }
       else {
-        cd_builtin(argv[1]);
+        cd_builtin(command.argv[1]);
       }
     }
     else {
       if (input[0] != '\0') {
-        run_program(argv);
+        run_program(command.argv);
       }
     }
 
+    if (dup2(stdout_fd, STDOUT_FILENO) == -1) {
+      fprintf(stderr, "Failed to duplicate.\n");
+      break;
+    }
+
+    if (dup2(stderr_fd, STDERR_FILENO) == -1) {
+      fprintf(stderr, "Failed to duplicate.\n");
+      break;
+    }
   }
   
   return 0;
 }
 
-int parser(const char *input, char *argv[]) {
+int tokenize(const char *input, Token tokens[], size_t capacity) {
+  int token_count = 0;
   int arg_len = 0;
-  int argc = 0;
   int arg_started = 0;
   int escape_flag = 0;
   enum quote_state single_quote = OUTSIDE;
@@ -121,13 +166,18 @@ int parser(const char *input, char *argv[]) {
   char current_arg[MAX_ARG_LEN];
 
   for(int i = 0; ; i++) {
+    tokens[token_count].text = NULL;
+    if ((size_t)token_count >= capacity) {
+      return -1;
+    }
     char c = input[i];
     if (c == '\0') {
       if (single_quote == OUTSIDE && double_quote == OUTSIDE && escape_flag == 0) {
         if (arg_started || arg_len > 0) {
           current_arg[arg_len] = '\0';
-          argv[argc] = strdup(current_arg);
-          argc++;
+          tokens[token_count].type = TOKEN_WORD;
+          tokens[token_count].text = strdup(current_arg);
+          token_count++;
         }
         break;
       }
@@ -175,10 +225,11 @@ int parser(const char *input, char *argv[]) {
         }
         else {
           current_arg[arg_len] = '\0';
-          argv[argc] = strdup(current_arg);
+          tokens[token_count].type = TOKEN_WORD;
+          tokens[token_count].text = strdup(current_arg);
           arg_len = 0;
           arg_started = 0;
-          argc++;
+          token_count++;
         }
       }
     }
@@ -213,6 +264,47 @@ int parser(const char *input, char *argv[]) {
           arg_started = 1;
         }
       }
+      else if (c == '>' && escape_flag == 0 && single_quote == OUTSIDE && double_quote == OUTSIDE) {    
+        int std_stream = 0;  
+        if (current_arg[0] == '1' && arg_len == 1) {
+          arg_len = 0;
+          arg_started = 0;
+          current_arg[0] = '\0';
+          std_stream = 1;
+        }
+
+        if (current_arg[0] == '2' && arg_len == 1) {
+          arg_len = 0;
+          arg_started = 0;
+          current_arg[0] = '\0';
+          std_stream = 2;
+        }
+
+        if (arg_started) {
+          current_arg[arg_len] = '\0';
+
+          tokens[token_count].type = TOKEN_WORD;
+          tokens[token_count].text = strdup(current_arg);
+          token_count++;
+
+          arg_len = 0;
+          arg_started = 0;
+          current_arg[0] = '\0';
+        }
+
+        if (std_stream == 1) {
+          tokens[token_count].type = TOKEN_STDOUT_REDIRECT;
+        }
+        else if (std_stream == 2) {
+          tokens[token_count].type = TOKEN_STDERR_REDIRECT;
+        }
+        else {
+          tokens[token_count].type = TOKEN_STDOUT_REDIRECT;
+        }
+        
+        tokens[token_count].text = NULL;
+        token_count++;
+      }
       else {
         if (arg_len < MAX_ARG_LEN - 1) {
             current_arg[arg_len++] = c;
@@ -223,9 +315,82 @@ int parser(const char *input, char *argv[]) {
     }
   }
   
-  argv[argc] = NULL;
+  return token_count;
+}
 
-  return argc;
+int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command) {
+  int expecting_stdout_output_file = 0;
+  int expecting_stderr_output_file = 0;
+  int append_stdout_output_file = 0;
+  int append_stderr_output_file = 0;
+
+  command->argc = 0;
+  command->argv[0] = NULL;
+  command->stdout_mode = OVERWRITE;
+  command->stderr_mode = OVERWRITE;
+  command->stdout_output_file = NULL;
+  command->stderr_output_file = NULL;
+
+  for (size_t i = 0; i < token_count; i++) {
+    const Token *token = &tokens[i];
+    // printf("token->type: %d, token->text: %s\n", token->type, token->text);
+    if (token->type == TOKEN_STDOUT_REDIRECT) {
+      if(expecting_stdout_output_file && !append_stdout_output_file) {
+        append_stdout_output_file = 1;
+        command->stdout_mode = APPEND;
+      }
+      else if (expecting_stdout_output_file && append_stdout_output_file) {
+        fprintf(stderr, "syntax error near unexpected token '>'\n");
+        return -1;
+      } else {
+        expecting_stdout_output_file = 1;
+        append_stdout_output_file = 0;
+        command->stdout_mode = OVERWRITE;
+      }
+
+      continue;
+    }
+
+    if (token->type == TOKEN_STDERR_REDIRECT) {
+      if(expecting_stderr_output_file && !append_stderr_output_file) {
+        append_stderr_output_file = 1;
+        command->stderr_mode = APPEND;
+      }
+      else if (expecting_stderr_output_file && append_stderr_output_file) {
+        fprintf(stderr, "syntax error near unexpected token '>'\n");
+        return -1;
+      } else {
+        expecting_stderr_output_file = 1;
+        append_stderr_output_file = 0;
+        command->stderr_mode = OVERWRITE;
+      }
+
+      continue;
+    }
+
+    if (expecting_stdout_output_file) {
+      command->stdout_output_file = token->text;
+      expecting_stdout_output_file = 0;
+      append_stdout_output_file = 0;
+    } 
+    else if (expecting_stderr_output_file) {
+      command->stderr_output_file = token->text;
+      expecting_stderr_output_file = 0;
+      append_stderr_output_file = 0;
+    } 
+    else {
+      if (command->argc >= MAX_ARGS) {
+        fprintf(stderr, "Error: Too many arguments (max %d).\n", MAX_ARGS);
+        return -1;
+      }
+
+      command->argv[command->argc++] = token->text;
+      command->argv[command->argc] = NULL;
+    }
+
+  }
+
+  return command->argc;
 }
 
 Builtin type_command(const char *cmd) {
@@ -399,14 +564,62 @@ void run_program(char *argv[]) {
     int status;
     waitpid(pid, &status, 0);
     free(full_path);
-  } 
+  }
   
 }
 
+int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection_mode stderr_redirect_mode, const char *stdout_output_file, const char *stderr_output_file) {
+  int stdout_output_file_fd, stderr_output_file_fd;
 
-void free_argv(char *argv[]) {
-  for (int i = 0; argv[i] != NULL; i++){
-    free(argv[i]);
-    argv[i] = NULL;
+  if (stdout_output_file != NULL) {
+    if (stdout_redirect_mode == OVERWRITE) {
+      if ( (stdout_output_file_fd = open (stdout_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0664)) == -1) {
+        fprintf(stderr, "Failed to open file.\n");
+        return -1;
+      }
+    } else {
+      if ( (stdout_output_file_fd = open (stdout_output_file, O_WRONLY | O_CREAT | O_APPEND, 0664)) == -1) {
+        fprintf(stderr, "Failed to open file.\n");
+        return -1;
+      }
+    }
+
+    if (dup2(stdout_output_file_fd, STDOUT_FILENO) == -1) {
+      fprintf(stderr, "Failed to duplicate.\n");
+      return -1;
+    }
+
+    close(stdout_output_file_fd);
+  }
+
+  if (stderr_output_file != NULL) {
+    if(stderr_redirect_mode == OVERWRITE) {
+      if ( (stderr_output_file_fd = open (stderr_output_file, O_WRONLY | O_CREAT | O_TRUNC, 0664)) == -1) {
+        fprintf(stderr, "Failed to open file.\n");
+        return -1;
+      }
+    }else {
+      if ( (stderr_output_file_fd = open (stderr_output_file, O_WRONLY | O_CREAT | O_APPEND, 0664)) == -1) {
+        fprintf(stderr, "Failed to open file.\n");
+        return -1;
+      }  
+    }
+    
+
+    if (dup2(stderr_output_file_fd, STDERR_FILENO) == -1) {
+      fprintf(stderr, "Failed to duplicate.\n");
+      return -1;
+    }
+
+    close(stderr_output_file_fd);
+  }
+  
+  return 0;
+}
+
+void free_tokens(Token tokens[], size_t token_count) {
+  for (size_t i = 0; i < token_count; i++){
+    free(tokens[i].text);
+    tokens[i].text = NULL;
   }
 }
