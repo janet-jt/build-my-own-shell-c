@@ -1,14 +1,18 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <unistd.h>
-#include <limits.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
+#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+#include <dirent.h>
 
 #define INPUT_SIZE 2048
 #define MAX_ARGS 64
@@ -26,7 +30,9 @@ typedef enum {
 typedef enum {
   TOKEN_WORD,
   TOKEN_STDOUT_REDIRECT,
-  TOKEN_STDERR_REDIRECT
+  TOKEN_STDERR_REDIRECT,
+  TOKEN_STDOUT_APPEND,
+  TOKEN_STDERR_APPEND
 } TokenType;
 
 typedef struct {
@@ -53,9 +59,23 @@ enum quote_state {
   INSIDE
 };
 
+static const char *builtin_commands[] = {
+  "cd",
+  "pwd",
+  "echo",
+  "exit",
+  "type",
+  NULL
+};
+
+
 Builtin type_command(const char *cmd);
 int tokenize(const char *input, Token tokens[], size_t capacity);
 int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command);
+static int is_first_command(int start);
+char **shell_completion(const char *input, int start, int end);
+char* dir_discovery();
+char *command_generator(const char *input, int state);
 void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
 void pwd_builtin();
@@ -63,28 +83,37 @@ void cd_builtin(const char *path);
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
 void run_program(char *argv[]);
-int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection_mode stderr_redirect_mode, const char *stdout_output_file, const char *stderr_output_file);
+int std_redirection(enum redirection_mode stdout_redirect_mode, 
+                    enum redirection_mode stderr_redirect_mode, 
+                    const char *stdout_output_file, 
+                    const char *stderr_output_file);
 void free_tokens(Token tokens[], size_t token_count);
 
 
 int main(void) {
   setbuf(stdout, NULL);
+
+  rl_attempted_completion_function = shell_completion;
   
   while (1) {  
     int argc, token_count;
-    char input[INPUT_SIZE];
+    char *input;
     int stdout_fd = dup(STDOUT_FILENO);
     int stderr_fd = dup(STDERR_FILENO);
     
-    printf("$ ");
     fflush(stdout);
 
-    if (fgets(input, sizeof input, stdin) == NULL ) {
+    input = readline("$ ");
+    if(input == NULL) {
       break;
     }
 
-    size_t len = strcspn(input, "\r\n");
-    input[len] = '\0';
+    if (input[0] == '\0') {
+      free(input);
+      continue;
+    }
+
+    add_history(input);
 
     Token tokens[INPUT_SIZE];
     ParsedCommand command;
@@ -97,12 +126,7 @@ int main(void) {
       continue;
     }
 
-    if (argc == 0) {
-      continue;
-    }
-
     if (argc == -1) {
-      printf("> ");
       continue;
     }
 
@@ -141,6 +165,8 @@ int main(void) {
       }
     }
 
+    free_tokens(tokens, token_count);
+
     if (dup2(stdout_fd, STDOUT_FILENO) == -1) {
       fprintf(stderr, "Failed to duplicate.\n");
       break;
@@ -150,6 +176,7 @@ int main(void) {
       fprintf(stderr, "Failed to duplicate.\n");
       break;
     }
+
   }
   
   return 0;
@@ -264,27 +291,31 @@ int tokenize(const char *input, Token tokens[], size_t capacity) {
           arg_started = 1;
         }
       }
-      else if (c == '>' && escape_flag == 0 && single_quote == OUTSIDE && double_quote == OUTSIDE) {    
+      else if (c == '>' && escape_flag == 0 && single_quote == OUTSIDE && double_quote == OUTSIDE) {  
+        int is_append = (input[i + 1] == '>');
         int std_stream = 0;  
-        if (current_arg[0] == '1' && arg_len == 1) {
-          arg_len = 0;
-          arg_started = 0;
-          current_arg[0] = '\0';
-          std_stream = 1;
-        }
 
-        if (current_arg[0] == '2' && arg_len == 1) {
+        if (arg_len == 1 && (current_arg[0] == '1' || current_arg[0] == '2')) {
+          std_stream = (current_arg[0] == '2')
+                          ? STDERR_FILENO
+                          : STDOUT_FILENO;
           arg_len = 0;
           arg_started = 0;
           current_arg[0] = '\0';
-          std_stream = 2;
         }
 
         if (arg_started) {
+
+          if((size_t)token_count >= capacity) {
+            return -1;
+          }
+
           current_arg[arg_len] = '\0';
 
+          char *text = strdup(current_arg);
+
           tokens[token_count].type = TOKEN_WORD;
-          tokens[token_count].text = strdup(current_arg);
+          tokens[token_count].text = text;
           token_count++;
 
           arg_len = 0;
@@ -292,18 +323,22 @@ int tokenize(const char *input, Token tokens[], size_t capacity) {
           current_arg[0] = '\0';
         }
 
-        if (std_stream == 1) {
-          tokens[token_count].type = TOKEN_STDOUT_REDIRECT;
+        if((size_t)token_count >= capacity) {
+          return -1;
         }
-        else if (std_stream == 2) {
-          tokens[token_count].type = TOKEN_STDERR_REDIRECT;
-        }
-        else {
-          tokens[token_count].type = TOKEN_STDOUT_REDIRECT;
+
+        if (std_stream == STDERR_FILENO) {
+          tokens[token_count].type = is_append ? TOKEN_STDERR_APPEND : TOKEN_STDERR_REDIRECT;
+        } else {
+          tokens[token_count].type = is_append ? TOKEN_STDOUT_APPEND : TOKEN_STDOUT_REDIRECT;
         }
         
         tokens[token_count].text = NULL;
         token_count++;
+
+        if (is_append) {
+          i++;
+        }
       }
       else {
         if (arg_len < MAX_ARG_LEN - 1) {
@@ -321,8 +356,6 @@ int tokenize(const char *input, Token tokens[], size_t capacity) {
 int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command) {
   int expecting_stdout_output_file = 0;
   int expecting_stderr_output_file = 0;
-  int append_stdout_output_file = 0;
-  int append_stderr_output_file = 0;
 
   command->argc = 0;
   command->argv[0] = NULL;
@@ -334,36 +367,26 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command
   for (size_t i = 0; i < token_count; i++) {
     const Token *token = &tokens[i];
     // printf("token->type: %d, token->text: %s\n", token->type, token->text);
-    if (token->type == TOKEN_STDOUT_REDIRECT) {
-      if(expecting_stdout_output_file && !append_stdout_output_file) {
-        append_stdout_output_file = 1;
-        command->stdout_mode = APPEND;
-      }
-      else if (expecting_stdout_output_file && append_stdout_output_file) {
-        fprintf(stderr, "syntax error near unexpected token '>'\n");
+    if (token->type == TOKEN_STDOUT_REDIRECT || token->type == TOKEN_STDOUT_APPEND) {
+      if(expecting_stdout_output_file || expecting_stderr_output_file) {
+        fprintf(stderr, "syntax error: expected redirection filename.\n");
         return -1;
-      } else {
-        expecting_stdout_output_file = 1;
-        append_stdout_output_file = 0;
-        command->stdout_mode = OVERWRITE;
       }
+     
+      command->stdout_mode = (token->type == TOKEN_STDOUT_APPEND ? APPEND:OVERWRITE);
+      expecting_stdout_output_file = 1;
 
       continue;
     }
 
-    if (token->type == TOKEN_STDERR_REDIRECT) {
-      if(expecting_stderr_output_file && !append_stderr_output_file) {
-        append_stderr_output_file = 1;
-        command->stderr_mode = APPEND;
-      }
-      else if (expecting_stderr_output_file && append_stderr_output_file) {
-        fprintf(stderr, "syntax error near unexpected token '>'\n");
+    if (token->type == TOKEN_STDERR_REDIRECT || token->type == TOKEN_STDERR_APPEND) {
+      if(expecting_stdout_output_file || expecting_stderr_output_file) {
+        fprintf(stderr, "syntax error: expected redirection filename.\n");
         return -1;
-      } else {
-        expecting_stderr_output_file = 1;
-        append_stderr_output_file = 0;
-        command->stderr_mode = OVERWRITE;
       }
+     
+      command->stderr_mode = (token->type == TOKEN_STDERR_APPEND ? APPEND:OVERWRITE);
+      expecting_stderr_output_file = 1;
 
       continue;
     }
@@ -371,12 +394,10 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command
     if (expecting_stdout_output_file) {
       command->stdout_output_file = token->text;
       expecting_stdout_output_file = 0;
-      append_stdout_output_file = 0;
     } 
     else if (expecting_stderr_output_file) {
       command->stderr_output_file = token->text;
       expecting_stderr_output_file = 0;
-      append_stderr_output_file = 0;
     } 
     else {
       if (command->argc >= MAX_ARGS) {
@@ -391,6 +412,228 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command
   }
 
   return command->argc;
+}
+
+static int is_first_command(int start) {
+  for (int i = 0; i < start; i++) {
+    if(!isspace((unsigned char)rl_line_buffer[i])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+char **shell_completion(const char *input, int start, int end) {
+  (void)end;
+  char **matches;
+
+  matches = (char **)NULL;
+
+  if (start == 0 || is_first_command(start)) {
+    matches = rl_completion_matches(input, command_generator);
+    return (matches);
+  }
+  else {
+    return rl_completion_matches(input, rl_filename_completion_function);
+  }
+
+  return NULL;
+}
+
+char* dir_discovery() {
+  const char *path;
+  path = getenv("PATH");
+  
+  if (path == NULL) {
+    path = "/usr/bin:/bin";
+  }
+
+  return strdup(path);
+}
+
+static void free_candidates(char **items, size_t count) {
+  for(size_t i = 0; i < count; i++) {
+    free(items[i]);
+  }
+
+  free(items);
+}
+
+static int add_candidates(char ***items, size_t *count, size_t *capacity, const char *name) {
+  for(size_t i = 0; i < *count; i++) {
+    if(strcmp((*items)[i], name) == 0) {
+      return 0;
+    }
+  }
+
+  if (*count == *capacity) {
+    if(*capacity > SIZE_MAX / 2) {
+      return -1;
+    }
+
+    size_t new_capacity = (*capacity == 0) ? 16: *capacity *2;
+
+    if(new_capacity > SIZE_MAX / sizeof **items) {
+      return -1;
+    }
+
+    char **new_items = realloc(*items, new_capacity * sizeof **items);
+
+    if (new_items == NULL){
+      return -1;
+    }
+
+    *items = new_items;
+    *capacity = new_capacity;
+
+  }
+
+  char *copy = strdup(name);
+  if(copy == NULL) {
+    return -1;
+  }
+
+  (*items)[(*count)++] = copy;
+  return 0;
+
+}
+
+char *command_generator(const char *input, int state) {
+  static char **candidates = NULL;
+  static size_t candidate_count = 0;
+  static size_t candidate_capacity = 0;
+  static size_t candidate_index = 0;
+  
+  if(state == 0) {
+    char *env_path = NULL;
+    DIR *current_dir = NULL;
+    size_t input_len = strlen(input);
+
+    free_candidates(candidates, candidate_count);
+    candidates = NULL;
+    candidate_count = 0;
+    candidate_capacity = 0;
+    candidate_index = 0;
+
+    for(size_t i = 0; builtin_commands[i] != NULL; i++) {
+      const char *name = builtin_commands[i];
+
+      if(strncmp(name, input, input_len) == 0) {
+        if(add_candidates(&candidates, &candidate_count, &candidate_capacity, name) == -1) {
+          goto build_failed;
+        }
+      }
+    }
+
+    env_path = dir_discovery();
+    if(env_path == NULL) {
+      goto build_failed;
+    }
+
+    char *path_ptr = env_path;
+    char *dir;
+
+    while ((dir = strsep(&path_ptr, ":")) != NULL) {
+      if(*dir == '\0') {
+        dir = ".";
+      }
+
+      current_dir = opendir(dir);
+
+      if(current_dir == NULL) {
+        continue;
+      }
+
+      struct dirent *entry;
+
+      while ((entry = readdir(current_dir)) != NULL) {
+        const char *name = entry->d_name;
+
+        if(strncmp(name, input, input_len) != 0) {
+          continue;
+        }
+
+        size_t dir_len = strlen(dir);
+        size_t name_len = strlen(name);
+
+        if(dir_len > SIZE_MAX - name_len - 2){
+          goto build_failed;
+        }
+
+        size_t path_size = dir_len + name_len + 2;
+        char *full_path = malloc(path_size);
+
+        if(full_path == NULL) {
+          goto build_failed;
+        }
+
+        snprintf(full_path, path_size, "%s/%s", dir, name);
+
+        struct stat file_stat;
+        int is_executable = 
+            stat(full_path, &file_stat) == 0 &&
+            S_ISREG(file_stat.st_mode) &&
+            access(full_path, X_OK) == 0;
+
+        free(full_path);
+        
+        if(is_executable) {
+          if (add_candidates(&candidates,
+                            &candidate_count,
+                            &candidate_capacity,
+                            name) == -1) {
+            goto build_failed;
+          }
+        }
+      }
+
+    
+      closedir(current_dir);
+      current_dir = NULL;
+    }
+
+    free(env_path);
+    goto build_complete;
+
+build_failed:
+    if (current_dir != NULL) {
+      closedir(current_dir);
+    }
+
+    free(env_path);
+    free_candidates(candidates, candidate_count);
+
+    candidates = NULL;
+    candidate_count = 0;
+    candidate_capacity = 0;
+    candidate_index = 0;
+
+    fprintf(stderr, "Failed to allocate completion candidates.\n");
+    return NULL;
+
+build_complete:
+    ;
+  }
+
+  if(candidate_index < candidate_count) {
+    char *match = strdup(candidates[candidate_index]);
+
+    if(match != NULL) {
+      candidate_index++;
+      return match;
+    }
+
+    fprintf(stderr, "Falied to allocate completion match.\n");
+  }
+
+  free_candidates(candidates, candidate_count);
+
+  candidates = NULL;
+  candidate_count = 0;
+  candidate_capacity = 0;
+  candidate_index = 0;
+
+  return NULL;
 }
 
 Builtin type_command(const char *cmd) {
@@ -477,7 +720,7 @@ void cd_builtin(const char *path) {
   }
   free(cd_path);
 }
- 
+
 char* search_path(const char *cmd) {
   if (cmd == NULL || *cmd == '\0') {
     return NULL;
@@ -486,12 +729,8 @@ char* search_path(const char *cmd) {
   const char *raw_path;
   char *env_path, *path_ptr, *dir;
   char *found_path = NULL;
-  
-  raw_path = getenv("PATH");
-  
-  if (raw_path == NULL) {
-    raw_path = "/usr/bin:/bin";
-  }
+
+  raw_path = dir_discovery();
 
   env_path = strdup(raw_path);
 

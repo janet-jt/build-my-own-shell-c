@@ -1,5 +1,6 @@
 CC := gcc
 CFLAGS := -Wall -Wextra -g
+LIBS = -lreadline
 
 SRC_DIR := src
 BUILD_DIR := build
@@ -13,7 +14,7 @@ HEADERS := $(wildcard $(SRC_DIR)/*.h)
 all: $(TARGET)
 
 $(TARGET): $(SOURCES) $(HEADERS) Makefile | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SOURCES) -o $(TARGET)
+	$(CC) $(CFLAGS) $(SOURCES) -o $(TARGET) $(LIBS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
