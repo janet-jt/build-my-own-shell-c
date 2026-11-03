@@ -32,7 +32,8 @@ typedef enum {
   TOKEN_STDOUT_REDIRECT,
   TOKEN_STDERR_REDIRECT,
   TOKEN_STDOUT_APPEND,
-  TOKEN_STDERR_APPEND
+  TOKEN_STDERR_APPEND,
+  TOKEN_PIPE
 } TokenType;
 
 typedef struct {
@@ -68,13 +69,15 @@ static const char *builtin_commands[] = {
   NULL
 };
 
-
 Builtin type_command(const char *cmd);
 int tokenize(const char *input, Token tokens[], size_t capacity);
 int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command);
+int execute_command(ParsedCommand command, int argc);
 static int is_first_command(int start);
 char **shell_completion(const char *input, int start, int end);
 char* dir_discovery();
+static void free_candidates(char **items, size_t count);
+static int add_candidates(char ***items, size_t *count, size_t *capacity, const char *name);
 char *command_generator(const char *input, int state);
 void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
@@ -116,6 +119,7 @@ int main(void) {
     add_history(input);
 
     Token tokens[INPUT_SIZE];
+    char *commands;
     ParsedCommand command;
 
     token_count = tokenize(input, tokens, sizeof tokens / sizeof tokens[0]);  
@@ -130,39 +134,9 @@ int main(void) {
       continue;
     }
 
-    if (command.stdout_output_file != NULL || command.stderr_output_file != NULL) {
-      std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
-    }
-
-    if (strncmp(command.argv[0], "exit" , 4) == 0) {
+    if (execute_command(command, argc) == 1) {
       free_tokens(tokens, token_count);
       break;
-    }
-    else if (strncmp(command.argv[0], "echo" , 4) == 0) {
-      echo_builtin(command.argc, command.argv);
-    }
-    else if (strncmp(command.argv[0], "type" , 4) == 0) {
-      if (argc == 1) {
-        printf("usage: type command\n");
-      } else {
-        type_builtin(command.argv[1]);
-      }
-    }
-    else if (strncmp(command.argv[0], "pwd", 3) == 0) {
-      pwd_builtin();
-    }
-    else if (strncmp(command.argv[0], "cd", 2) == 0) {
-      if (argc > 2) {
-        fprintf(stderr, "cd: too many arguments\n");
-      }
-      else {
-        cd_builtin(command.argv[1]);
-      }
-    }
-    else {
-      if (input[0] != '\0') {
-        run_program(command.argv);
-      }
     }
 
     free_tokens(tokens, token_count);
@@ -279,7 +253,7 @@ int tokenize(const char *input, Token tokens[], size_t capacity) {
       else if (c == '\"' && escape_flag == 0) {
         if (single_quote == OUTSIDE && double_quote == INSIDE) {
           double_quote = OUTSIDE;
-        } 
+        }
         else if (single_quote == OUTSIDE && double_quote == OUTSIDE) {
           double_quote = INSIDE;
           arg_started = 1;
@@ -339,6 +313,34 @@ int tokenize(const char *input, Token tokens[], size_t capacity) {
         if (is_append) {
           i++;
         }
+      }
+      else if (c == '|' && escape_flag == 0 && single_quote == OUTSIDE && double_quote == OUTSIDE) {
+        if (arg_started) {
+
+          if((size_t)token_count >= capacity) {
+            return -1;
+          }
+
+          current_arg[arg_len] = '\0';
+
+          char *text = strdup(current_arg);
+
+          tokens[token_count].type = TOKEN_WORD;
+          tokens[token_count].text = text;
+          token_count++;
+
+          arg_len = 0;
+          arg_started = 0;
+          current_arg[0] = '\0';
+        }
+
+        if((size_t)token_count >= capacity) {
+          return -1;
+        }
+
+        tokens[token_count].type = TOKEN_PIPE;
+        tokens[token_count].text = NULL;
+        token_count++;
       }
       else {
         if (arg_len < MAX_ARG_LEN - 1) {
@@ -414,6 +416,43 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command
   return command->argc;
 }
 
+int execute_command(ParsedCommand command, int argc) {
+     if (command.stdout_output_file != NULL || command.stderr_output_file != NULL) {
+      std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
+    }
+
+    if (strncmp(command.argv[0], "exit" , 4) == 0) {
+      return 1;
+    }
+    else if (strncmp(command.argv[0], "echo" , 4) == 0) {
+      echo_builtin(command.argc, command.argv);
+    }
+    else if (strncmp(command.argv[0], "type" , 4) == 0) {
+      if (argc == 1) {
+        printf("usage: type command\n");
+      } else {
+        type_builtin(command.argv[1]);
+      }
+    }
+    else if (strncmp(command.argv[0], "pwd", 3) == 0) {
+      pwd_builtin();
+    }
+    else if (strncmp(command.argv[0], "cd", 2) == 0) {
+      if (argc > 2) {
+        fprintf(stderr, "cd: too many arguments\n");
+        return -1;
+      }
+      else {
+        cd_builtin(command.argv[1]);
+      }
+    }
+    else {
+      run_program(command.argv);
+    }
+
+    return 0;
+}
+
 static int is_first_command(int start) {
   for (int i = 0; i < start; i++) {
     if(!isspace((unsigned char)rl_line_buffer[i])) {
@@ -461,17 +500,17 @@ static void free_candidates(char **items, size_t count) {
 
 static int add_candidates(char ***items, size_t *count, size_t *capacity, const char *name) {
   for(size_t i = 0; i < *count; i++) {
-    if(strcmp((*items)[i], name) == 0) {
+    if(strcmp((*items)[i], name) == 0 ) {
       return 0;
     }
   }
 
-  if (*count == *capacity) {
+  if(*count == *capacity){
     if(*capacity > SIZE_MAX / 2) {
       return -1;
     }
-
-    size_t new_capacity = (*capacity == 0) ? 16: *capacity *2;
+ 
+    size_t new_capacity = (*capacity ==0 ) ? 16 : *capacity * 2;
 
     if(new_capacity > SIZE_MAX / sizeof **items) {
       return -1;
@@ -485,7 +524,6 @@ static int add_candidates(char ***items, size_t *count, size_t *capacity, const 
 
     *items = new_items;
     *capacity = new_capacity;
-
   }
 
   char *copy = strdup(name);
@@ -495,7 +533,6 @@ static int add_candidates(char ***items, size_t *count, size_t *capacity, const 
 
   (*items)[(*count)++] = copy;
   return 0;
-
 }
 
 char *command_generator(const char *input, int state) {
@@ -853,6 +890,10 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
     close(stderr_output_file_fd);
   }
   
+  return 0;
+}
+
+int pipeline_executor() {
   return 0;
 }
 
