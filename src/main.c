@@ -7,7 +7,6 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <readline/readline.h>
@@ -17,6 +16,7 @@
 #define INPUT_SIZE 2048
 #define MAX_ARGS 64
 #define MAX_ARG_LEN 128
+#define MAX_PIPE_LIMIT 32
 
 typedef enum {
   BUILTIN_ECHO,
@@ -42,6 +42,7 @@ typedef struct {
 } Token;
 
 enum redirection_mode{
+  UNDEFINE,
   OVERWRITE,
   APPEND
 };
@@ -71,8 +72,8 @@ static const char *builtin_commands[] = {
 
 Builtin type_command(const char *cmd);
 int tokenize(const char *input, Token tokens[], size_t capacity);
-int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command);
-int execute_command(ParsedCommand command, int argc);
+int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands[], size_t command_capacity);
+int execute_command(ParsedCommand command);
 static int is_first_command(int start);
 char **shell_completion(const char *input, int start, int end);
 char* dir_discovery();
@@ -90,8 +91,8 @@ int std_redirection(enum redirection_mode stdout_redirect_mode,
                     enum redirection_mode stderr_redirect_mode, 
                     const char *stdout_output_file, 
                     const char *stderr_output_file);
+int pipeline_executor(ParsedCommand commands[], size_t command_capacity);
 void free_tokens(Token tokens[], size_t token_count);
-
 
 int main(void) {
   setbuf(stdout, NULL);
@@ -99,10 +100,12 @@ int main(void) {
   rl_attempted_completion_function = shell_completion;
   
   while (1) {  
-    int argc, token_count;
+    int token_count, executed_state;
     char *input;
     int stdout_fd = dup(STDOUT_FILENO);
     int stderr_fd = dup(STDERR_FILENO);
+    int stdin_fd = dup(STDIN_FILENO);
+    size_t command_capacity = 1;
     
     fflush(stdout);
 
@@ -119,27 +122,49 @@ int main(void) {
     add_history(input);
 
     Token tokens[INPUT_SIZE];
-    char *commands;
-    ParsedCommand command;
-
-    token_count = tokenize(input, tokens, sizeof tokens / sizeof tokens[0]);  
-    argc = parse_token(tokens, (size_t)token_count, &command);
     
-    if (argc >= MAX_ARGS) {
-      fprintf(stderr, "Error: Too many arguments (max %d).\n", MAX_ARGS);
+    token_count = tokenize(input, tokens, sizeof tokens / sizeof tokens[0]);  
+
+    for (size_t i = 0; i < (size_t)token_count; i++) {
+      const Token *token = &tokens[i];
+      if(token->type == TOKEN_PIPE) {
+        command_capacity++;
+      }
+    }
+
+    if (command_capacity > MAX_PIPE_LIMIT) {
+      free_tokens(tokens, token_count);
+      fprintf(stderr, "maximum pipe limit exceeded\n");
+      break;
+    }
+
+    ParsedCommand commands[command_capacity];
+
+    if (parse_token(tokens, (size_t)token_count, commands, command_capacity) == -1) {
       continue;
     }
 
-    if (argc == -1) {
-      continue;
-    }
+    if (command_capacity > 1) {
+      executed_state = pipeline_executor(commands, command_capacity);
+    } else {
+      executed_state = execute_command(commands[0]);
+    }    
 
-    if (execute_command(command, argc) == 1) {
+    if (executed_state == 1) {
       free_tokens(tokens, token_count);
       break;
     }
 
+    if (executed_state == -1) {
+      continue;
+    }
+
     free_tokens(tokens, token_count);
+
+    if (dup2(stdin_fd, STDIN_FILENO) == -1) {
+      fprintf(stderr, "Failed to duplicate.\n");
+      break;
+    }
 
     if (dup2(stdout_fd, STDOUT_FILENO) == -1) {
       fprintf(stderr, "Failed to duplicate.\n");
@@ -355,27 +380,47 @@ int tokenize(const char *input, Token tokens[], size_t capacity) {
   return token_count;
 }
 
-int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command) {
+void initialize_command(ParsedCommand *command) {
+  command->argc = 0;
+  command->argv[0] = NULL;
+  command->stdout_mode = UNDEFINE;
+  command->stderr_mode = UNDEFINE;
+  command->stdout_output_file = NULL;
+  command->stderr_output_file = NULL;
+}
+
+int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands[], size_t command_capacity) {
+  int current_index = 0;
+  initialize_command(&commands[current_index]);
   int expecting_stdout_output_file = 0;
   int expecting_stderr_output_file = 0;
 
-  command->argc = 0;
-  command->argv[0] = NULL;
-  command->stdout_mode = OVERWRITE;
-  command->stderr_mode = OVERWRITE;
-  command->stdout_output_file = NULL;
-  command->stderr_output_file = NULL;
-
   for (size_t i = 0; i < token_count; i++) {
+    
     const Token *token = &tokens[i];
-    // printf("token->type: %d, token->text: %s\n", token->type, token->text);
+
+    printf("token->type: %d, token->text: %s, STDMODE: %d\n", token->type, token->text, commands[current_index].stdout_mode);
+
+    if (token->type == TOKEN_PIPE) {
+      current_index ++;
+      expecting_stdout_output_file = 0;
+      expecting_stderr_output_file = 0;
+      if ((size_t)current_index < command_capacity) {
+        initialize_command(&commands[current_index]);
+      } else {
+        fprintf(stderr, "Out of capacity");
+        return -1;
+      }
+      continue;
+    }
+
     if (token->type == TOKEN_STDOUT_REDIRECT || token->type == TOKEN_STDOUT_APPEND) {
       if(expecting_stdout_output_file || expecting_stderr_output_file) {
         fprintf(stderr, "syntax error: expected redirection filename.\n");
         return -1;
       }
-     
-      command->stdout_mode = (token->type == TOKEN_STDOUT_APPEND ? APPEND:OVERWRITE);
+    
+      commands[current_index].stdout_mode = (token->type == TOKEN_STDOUT_APPEND ? APPEND:OVERWRITE);
       expecting_stdout_output_file = 1;
 
       continue;
@@ -386,71 +431,69 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand *command
         fprintf(stderr, "syntax error: expected redirection filename.\n");
         return -1;
       }
-     
-      command->stderr_mode = (token->type == TOKEN_STDERR_APPEND ? APPEND:OVERWRITE);
+    
+      commands[current_index].stderr_mode = (token->type == TOKEN_STDERR_APPEND ? APPEND:OVERWRITE);
       expecting_stderr_output_file = 1;
 
       continue;
     }
 
     if (expecting_stdout_output_file) {
-      command->stdout_output_file = token->text;
+      commands[current_index].stdout_output_file = token->text;
       expecting_stdout_output_file = 0;
     } 
     else if (expecting_stderr_output_file) {
-      command->stderr_output_file = token->text;
+      commands[current_index].stderr_output_file = token->text;
       expecting_stderr_output_file = 0;
     } 
     else {
-      if (command->argc >= MAX_ARGS) {
+      if (commands[current_index].argc >= MAX_ARGS) {
         fprintf(stderr, "Error: Too many arguments (max %d).\n", MAX_ARGS);
         return -1;
       }
-
-      command->argv[command->argc++] = token->text;
-      command->argv[command->argc] = NULL;
+      commands[current_index].argv[commands[current_index].argc++] = token->text;
+      commands[current_index].argv[commands[current_index].argc] = NULL;
     }
 
-  }
-
-  return command->argc;
 }
 
-int execute_command(ParsedCommand command, int argc) {
-     if (command.stdout_output_file != NULL || command.stderr_output_file != NULL) {
-      std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
-    }
+  return 0;
+}
 
-    if (strncmp(command.argv[0], "exit" , 4) == 0) {
-      return 1;
+int execute_command(ParsedCommand command) {
+  if (command.stdout_output_file != NULL || command.stderr_output_file != NULL) {
+    std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
+  }
+
+  if (strncmp(command.argv[0], "exit" , 4) == 0) {
+    return 1;
+  }
+  else if (strncmp(command.argv[0], "echo" , 4) == 0) {
+    echo_builtin(command.argc, command.argv);
+  }
+  else if (strncmp(command.argv[0], "type" , 4) == 0) {
+    if (command.argc == 1) {
+      printf("usage: type command\n");
+    } else {
+      type_builtin(command.argv[1]);
     }
-    else if (strncmp(command.argv[0], "echo" , 4) == 0) {
-      echo_builtin(command.argc, command.argv);
-    }
-    else if (strncmp(command.argv[0], "type" , 4) == 0) {
-      if (argc == 1) {
-        printf("usage: type command\n");
-      } else {
-        type_builtin(command.argv[1]);
-      }
-    }
-    else if (strncmp(command.argv[0], "pwd", 3) == 0) {
-      pwd_builtin();
-    }
-    else if (strncmp(command.argv[0], "cd", 2) == 0) {
-      if (argc > 2) {
-        fprintf(stderr, "cd: too many arguments\n");
-        return -1;
-      }
-      else {
-        cd_builtin(command.argv[1]);
-      }
+  }
+  else if (strncmp(command.argv[0], "pwd", 3) == 0) {
+    pwd_builtin();
+  }
+  else if (strncmp(command.argv[0], "cd", 2) == 0) {
+    if (command.argc > 2) {
+      fprintf(stderr, "cd: too many arguments\n");
+      return -1;
     }
     else {
-      run_program(command.argv);
+      cd_builtin(command.argv[1]);
     }
-
-    return 0;
+  }
+  else {
+    run_program(command.argv);
+  }
+  return 0;
 }
 
 static int is_first_command(int start) {
@@ -893,7 +936,41 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
   return 0;
 }
 
-int pipeline_executor() {
+int pipeline_executor(ParsedCommand commands[], size_t command_capacity) {
+  int prev_pipe_read = -1;
+
+  for(size_t current_index = 0; current_index < command_capacity; current_index++) {
+    
+    int pipefd[2];
+    
+    if(current_index < command_capacity - 1) {
+      if( pipe(pipefd) == -1 ) {
+        perror("pipe failed");
+        return -1;
+      }
+    }
+    
+    if( current_index > 0 ) {
+      if( pipe(pipefd) == -1 ) {
+        perror("pipe failed");
+        return -1;
+      }
+      dup2(prev_pipe_read, STDIN_FILENO);
+      close(prev_pipe_read);
+    }
+
+    if(execute_command(commands[current_index]) == -1) {
+      fprintf(stderr, "Failed to run the command.\n");
+      return -1;
+    }
+
+    if( current_index < command_capacity - 1) {
+      close(pipefd[1]);
+      prev_pipe_read = pipefd[0];
+    }
+
+  }
+
   return 0;
 }
 
