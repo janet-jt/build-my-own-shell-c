@@ -140,12 +140,18 @@ int main(void) {
 
     ParsedCommand commands[command_capacity];
 
-    if (parse_token(tokens, (size_t)token_count, commands, command_capacity) == -1) {
+    int command_count = parse_token(tokens, (size_t)token_count, commands, command_capacity);
+
+    if (command_count == 0) {
       continue;
     }
 
-    if (command_capacity > 1) {
-      executed_state = pipeline_executor(commands, command_capacity);
+    if (command_count == -1) {
+      continue;
+    }
+
+    if (command_count > 1) {
+      executed_state = pipeline_executor(commands, (size_t)command_count);
     } else {
       executed_state = execute_command(commands[0]);
     }    
@@ -390,6 +396,14 @@ void initialize_command(ParsedCommand *command) {
 }
 
 int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands[], size_t command_capacity) {
+  if (token_count == 0) {
+    return 0;
+  }
+
+  if (command_capacity == 0) {
+    fprintf(stderr, "Out of capacity.\n");
+    return -1;
+  }
   int current_index = 0;
   initialize_command(&commands[current_index]);
   int expecting_stdout_output_file = 0;
@@ -399,18 +413,26 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands
     
     const Token *token = &tokens[i];
 
-    printf("token->type: %d, token->text: %s, STDMODE: %d\n", token->type, token->text, commands[current_index].stdout_mode);
+    // printf("token->type: %d, token->text: %s, STDMODE: %d, Outfile: %s\n", token->type, token->text, commands[current_index].stdout_mode, commands[current_index].stdout_output_file);
 
     if (token->type == TOKEN_PIPE) {
-      current_index ++;
-      expecting_stdout_output_file = 0;
-      expecting_stderr_output_file = 0;
-      if ((size_t)current_index < command_capacity) {
-        initialize_command(&commands[current_index]);
-      } else {
+      if(expecting_stdout_output_file || expecting_stderr_output_file) {
+        fprintf(stderr, "syntax error: expected redirection filename.\n");
+        return -1;
+      }
+
+      if (commands[current_index].argc == 0) {
+        fprintf(stderr, "syntax error: expected command before '|'.\n");
+        return -1;
+      }
+      
+      if ((size_t)current_index > command_capacity) {
         fprintf(stderr, "Out of capacity");
         return -1;
       }
+
+      current_index ++;
+      initialize_command(&commands[current_index]);
       continue;
     }
 
@@ -438,6 +460,11 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands
       continue;
     }
 
+    if (token->type != TOKEN_WORD || token->text == NULL) {
+      fprintf(stderr, "syntax error: expected word.\n");
+      return -1;
+    }
+
     if (expecting_stdout_output_file) {
       commands[current_index].stdout_output_file = token->text;
       expecting_stdout_output_file = 0;
@@ -451,13 +478,24 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands
         fprintf(stderr, "Error: Too many arguments (max %d).\n", MAX_ARGS);
         return -1;
       }
+
       commands[current_index].argv[commands[current_index].argc++] = token->text;
       commands[current_index].argv[commands[current_index].argc] = NULL;
     }
 
-}
+  }
 
-  return 0;
+  if(expecting_stdout_output_file || expecting_stderr_output_file) {
+    fprintf(stderr, "syntax error: expected redirection filename.\n");
+    return -1;
+  }
+
+  if (commands[current_index].argc == 0) {
+    fprintf(stderr, "syntax error: expected command.\n");
+    return -1;
+  }
+
+  return current_index + 1;
 }
 
 int execute_command(ParsedCommand command) {
@@ -465,23 +503,23 @@ int execute_command(ParsedCommand command) {
     std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
   }
 
-  if (strncmp(command.argv[0], "exit" , 4) == 0) {
+  if (strncmp(command.argv[0], "exit" , 4) == 0 && strlen(command.argv[0]) == 4) {
     return 1;
   }
-  else if (strncmp(command.argv[0], "echo" , 4) == 0) {
+  else if (strncmp(command.argv[0], "echo" , 4) == 0 && strlen(command.argv[0]) == 4) {
     echo_builtin(command.argc, command.argv);
   }
-  else if (strncmp(command.argv[0], "type" , 4) == 0) {
+  else if (strncmp(command.argv[0], "type" , 4) == 0 && strlen(command.argv[0]) == 4) {
     if (command.argc == 1) {
       printf("usage: type command\n");
     } else {
       type_builtin(command.argv[1]);
     }
   }
-  else if (strncmp(command.argv[0], "pwd", 3) == 0) {
+  else if (strncmp(command.argv[0], "pwd", 3) == 0 && strlen(command.argv[0]) == 3) {
     pwd_builtin();
   }
-  else if (strncmp(command.argv[0], "cd", 2) == 0) {
+  else if (strncmp(command.argv[0], "cd", 2) == 0 && strlen(command.argv[0]) == 2) {
     if (command.argc > 2) {
       fprintf(stderr, "cd: too many arguments\n");
       return -1;
@@ -937,39 +975,6 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
 }
 
 int pipeline_executor(ParsedCommand commands[], size_t command_capacity) {
-  int prev_pipe_read = -1;
-
-  for(size_t current_index = 0; current_index < command_capacity; current_index++) {
-    
-    int pipefd[2];
-    
-    if(current_index < command_capacity - 1) {
-      if( pipe(pipefd) == -1 ) {
-        perror("pipe failed");
-        return -1;
-      }
-    }
-    
-    if( current_index > 0 ) {
-      if( pipe(pipefd) == -1 ) {
-        perror("pipe failed");
-        return -1;
-      }
-      dup2(prev_pipe_read, STDIN_FILENO);
-      close(prev_pipe_read);
-    }
-
-    if(execute_command(commands[current_index]) == -1) {
-      fprintf(stderr, "Failed to run the command.\n");
-      return -1;
-    }
-
-    if( current_index < command_capacity - 1) {
-      close(pipefd[1]);
-      prev_pipe_read = pipefd[0];
-    }
-
-  }
 
   return 0;
 }
