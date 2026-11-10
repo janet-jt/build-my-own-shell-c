@@ -978,7 +978,9 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
 }
 
 int pipeline_executor(ParsedCommand commands[], size_t command_capacity) {
-
+  int writer_status, reader_status;
+  int writer_forked = 0;
+  int reader_forked = 0;
   int pipe_fd[2];
   pid_t writer_pid, reader_pid;
 
@@ -987,49 +989,80 @@ int pipeline_executor(ParsedCommand commands[], size_t command_capacity) {
     return -1;
   }
 
-  writer_pid = fork();
-  if (writer_pid == -1){
-    perror("fork");
-    close(pipe_fd[0]);
-    close(pipe_fd[1]);
-    return -1;
-  }
+  for(size_t i; i < command_capacity; i++) {
 
-  if (writer_pid == 0) {
-    close(pipe_fd[0]);
-    dup2(pipe_fd[1], STDOUT_FILENO);
-    close(pipe_fd[1]);
-
-    int executed_state = execute_command(commands[0]);
-    exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
-  }
-
-  reader_pid = fork();
-  if (reader_pid == -1){
-    perror("fork");
-    close(pipe_fd[0]);
-    close(pipe_fd[1]);
-    return -1;
-  }
-
-  if (reader_pid == 0) {
-    close(pipe_fd[1]);
-    dup2(pipe_fd[0], STDIN_FILENO);
-    close(pipe_fd[0]);
+    if (writer_forked & reader_forked) {
+      waitpid(writer_pid, &writer_status, 0);
+      waitpid(reader_pid, &reader_status, 0);
+    }
     
-    int executed_state = execute_command(commands[1]);
-    exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+    if (i % 2 == 0) {
+      writer_pid = fork();
+      if (writer_pid == -1){
+        perror("fork");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return -1;
+      }
+      writer_forked = 1;
+      if (writer_pid == 0) {
+        close(pipe_fd[0]);
+        dup2(pipe_fd[1], STDOUT_FILENO);
+        close(pipe_fd[1]);
+
+        int executed_state = execute_command(commands[i]);
+        exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+      }
+    }
+    else if (i % 2 != 0 && i != command_capacity - 1) {
+      reader_pid = fork();
+      reader_forked = 1;
+      if (reader_pid == -1){
+        perror("fork");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return -1;
+      }
+
+      if (reader_pid == 0) {
+        close(pipe_fd[1]);
+        dup2(pipe_fd[0], STDIN_FILENO);
+        close(pipe_fd[0]);
+        
+        int executed_state = execute_command(commands[i]);
+        exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+      }
+    }
+
+    if (i == command_capacity - 1) {
+      reader_pid = fork();
+      if (reader_pid == -1){
+        perror("fork");
+        close(pipe_fd[0]);
+        close(pipe_fd[1]);
+        return -1;
+      }
+
+      if (reader_pid == 0) {
+        close(pipe_fd[1]);
+        dup2(pipe_fd[0], STDIN_FILENO);
+        close(pipe_fd[0]);
+        
+        int executed_state = execute_command(commands[i]);
+        exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+      }
+    }
+
+    close(pipe_fd[0]);
+    close(pipe_fd[1]);
   }
 
   close(pipe_fd[0]);
   close(pipe_fd[1]);
 
-  int writer_status, readerstatus;
-  
   waitpid(writer_pid, &writer_status, 0);
-  waitpid(reader_pid, &readerstatus, 0);
+  waitpid(reader_pid, &reader_status, 0);
 
-  
   return 0;
 }
 
