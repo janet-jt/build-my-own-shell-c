@@ -102,9 +102,9 @@ int main(void) {
   while (1) {  
     int token_count, executed_state;
     char *input;
+    int stdin_fd = dup(STDIN_FILENO);
     int stdout_fd = dup(STDOUT_FILENO);
     int stderr_fd = dup(STDERR_FILENO);
-    int stdin_fd = dup(STDIN_FILENO);
     size_t command_capacity = 1;
     
     fflush(stdout);
@@ -151,7 +151,7 @@ int main(void) {
     }
 
     if (command_count > 1) {
-      executed_state = pipeline_executor(commands, (size_t)command_count);
+      executed_state = pipeline_executor(commands, (size_t)command_capacity);
     } else {
       executed_state = execute_command(commands[0]);
     }    
@@ -426,7 +426,7 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands
         return -1;
       }
       
-      if ((size_t)current_index > command_capacity) {
+      if ((size_t)current_index + 1 >= command_capacity) {
         fprintf(stderr, "Out of capacity");
         return -1;
       }
@@ -913,10 +913,13 @@ void run_program(char *argv[]) {
   }
 
   if (pid == 0) {
-    execv(full_path, argv);
-    perror("execv failed");
+    if (execv(full_path, argv) == -1) {
+      free(full_path);
+      perror("execv failed");
+      exit(EXIT_FAILURE);
+    }
     free(full_path);
-    exit(1);
+    exit(EXIT_SUCCESS);
   } else {
     int status;
     waitpid(pid, &status, 0);
@@ -976,6 +979,57 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
 
 int pipeline_executor(ParsedCommand commands[], size_t command_capacity) {
 
+  int pipe_fd[2];
+  pid_t writer_pid, reader_pid;
+
+  if (pipe(pipe_fd) == -1) {
+    perror("pipe");
+    return -1;
+  }
+
+  writer_pid = fork();
+  if (writer_pid == -1){
+    perror("fork");
+    close(pipe_fd[0]);
+    close(pipe_fd[1]);
+    return -1;
+  }
+
+  if (writer_pid == 0) {
+    close(pipe_fd[0]);
+    dup2(pipe_fd[1], STDOUT_FILENO);
+    close(pipe_fd[1]);
+
+    int executed_state = execute_command(commands[0]);
+    exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+  }
+
+  reader_pid = fork();
+  if (reader_pid == -1){
+    perror("fork");
+    close(pipe_fd[0]);
+    close(pipe_fd[1]);
+    return -1;
+  }
+
+  if (reader_pid == 0) {
+    close(pipe_fd[1]);
+    dup2(pipe_fd[0], STDIN_FILENO);
+    close(pipe_fd[0]);
+    
+    int executed_state = execute_command(commands[1]);
+    exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+  }
+
+  close(pipe_fd[0]);
+  close(pipe_fd[1]);
+
+  int writer_status, readerstatus;
+  
+  waitpid(writer_pid, &writer_status, 0);
+  waitpid(reader_pid, &readerstatus, 0);
+
+  
   return 0;
 }
 
