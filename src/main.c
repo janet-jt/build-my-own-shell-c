@@ -12,11 +12,18 @@
 #include <readline/readline.h>
 #include <readline/history.h>
 #include <dirent.h>
+#include <limits.h>
 
 #define INPUT_SIZE 2048
 #define MAX_ARGS 64
 #define MAX_ARG_LEN 128
 #define MAX_PIPE_LIMIT 32
+
+#define max(a, b) ({ \
+    __typeof__(a) _a = (a); \
+    __typeof__(b) _b = (b); \
+    _a > _b ? _a : _b; \
+})
 
 typedef enum {
   BUILTIN_ECHO,
@@ -24,6 +31,7 @@ typedef enum {
   BUILTIN_TYPE,
   BUILTIN_PWD,
   BUILTIN_CD,
+  BUILTIN_HISTORY,
   BUILTIN_UNKNOWN
 } Builtin;
 
@@ -61,12 +69,21 @@ enum quote_state {
   INSIDE
 };
 
+enum HistoryAction {
+  HISTORY_DISPLAY,
+  HISTORY_CLEAR,
+  HISTORY_WRITE,
+  HISTORY_READ,
+  HISTORY_APPEND
+};
+
 static const char *builtin_commands[] = {
   "cd",
   "pwd",
   "echo",
   "exit",
   "type",
+  "history",
   NULL
 };
 
@@ -84,6 +101,7 @@ void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
 void pwd_builtin();
 void cd_builtin(const char *path);
+void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file);
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
 void run_program(char *argv[]);
@@ -528,6 +546,78 @@ int execute_command(ParsedCommand command) {
       cd_builtin(command.argv[1]);
     }
   }
+  else if (strncmp(command.argv[0], "history", 7) == 0 && strlen(command.argv[0]) == 7) {
+    enum HistoryAction action;
+    int number_of_entries = 0;
+    const char *history_file = NULL;
+    if (command.argc == 2) {
+      if (strncmp(command.argv[1], "-" , 1) != 0) {
+        const char *arg = command.argv[1];
+        char *endptr;
+
+        errno = 0;
+        long val = strtol(arg, &endptr, 10);
+
+        if (endptr == arg || *endptr != '\0') {
+          fprintf(stderr,
+                  "history: %s: numeric argument required\n",
+                  arg);
+          return -1;
+        }
+
+        if (errno == ERANGE || val < 0 || val > INT_MAX) {
+          fprintf(stderr,
+                  "history: %s: count must be between 0 and %d\n",
+                  arg, INT_MAX);
+          return -1;
+        }
+
+        number_of_entries = (int)val;
+        action = HISTORY_DISPLAY;
+        history_builtin(action, number_of_entries, history_file);
+      } else {
+        if (strncmp(command.argv[1], "-c" , 2) == 0 && strlen(command.argv[1]) == 2) {
+          action = HISTORY_CLEAR;
+          history_builtin(action, number_of_entries, history_file);
+        }
+      }   
+    }
+    else if (command.argc > 2) {
+      if (strncmp(command.argv[1], "-" , 1) != 0) {
+        fprintf(stderr, "history: too many arguments\n");
+        return -1;
+      }
+      else if (strncmp(command.argv[1], "-c" , 2) == 0 && strlen(command.argv[1]) == 2) {
+          action = HISTORY_CLEAR;
+          history_builtin(action, number_of_entries, history_file);
+      }
+      else if (strncmp(command.argv[1], "-r" , 2) == 0 && strlen(command.argv[1]) == 2) {
+        action = HISTORY_READ;
+        history_file = command.argv[2];
+        history_builtin(action, number_of_entries, history_file);
+      }
+      else if (strncmp(command.argv[1], "-w" , 2) == 0 && strlen(command.argv[1]) == 2) {
+        action = HISTORY_WRITE;
+        history_file = command.argv[2];
+        history_builtin(action, number_of_entries, history_file);
+      }
+      else if (strncmp(command.argv[1], "-a" , 2) == 0 && strlen(command.argv[1]) == 2) {
+        action = HISTORY_APPEND;
+        history_file = command.argv[2];
+        history_builtin(action, number_of_entries, history_file);
+      }
+      else {
+        fprintf(stderr, "history: unknown options\n");
+        return -1;
+      }
+      
+    }
+    else {
+      action = HISTORY_DISPLAY;
+      history_builtin(action, number_of_entries, history_file);
+    }
+
+  }
   else {
     run_program(command.argv);
   }
@@ -755,11 +845,12 @@ build_complete:
 }
 
 Builtin type_command(const char *cmd) {
-  if (strncmp(cmd, "echo", 4) == 0) return BUILTIN_ECHO;
-  if (strncmp(cmd, "exit", 4) == 0) return BUILTIN_EXIT;
-  if (strncmp(cmd, "type", 4) == 0) return BUILTIN_TYPE;
-  if (strncmp(cmd, "pwd", 3) == 0) return BUILTIN_PWD;
-  if (strncmp(cmd, "cd", 2) == 0) return BUILTIN_CD;
+  if (strncmp(cmd, "echo", 4) == 0 && strlen(cmd) == 4) return BUILTIN_ECHO;
+  if (strncmp(cmd, "exit", 4) == 0 && strlen(cmd) == 4) return BUILTIN_EXIT;
+  if (strncmp(cmd, "type", 4) == 0 && strlen(cmd) == 4) return BUILTIN_TYPE;
+  if (strncmp(cmd, "pwd", 3) == 0 && strlen(cmd) == 3) return BUILTIN_PWD;
+  if (strncmp(cmd, "cd", 2) == 0 && strlen(cmd) == 2) return BUILTIN_CD;
+  if (strncmp(cmd, "history", 7) == 0 && strlen(cmd) == 7) return BUILTIN_HISTORY;
   return BUILTIN_UNKNOWN;
 }
 
@@ -780,6 +871,7 @@ void type_builtin(const char *cmd) {
     case BUILTIN_TYPE:
     case BUILTIN_PWD:
     case BUILTIN_CD:
+    case BUILTIN_HISTORY:
       printf("%s is a shell builtin\n", cmd);
       break;
     case BUILTIN_UNKNOWN:
@@ -837,6 +929,49 @@ void cd_builtin(const char *path) {
     return;
   }
   free(cd_path);
+}
+
+void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file) {
+  if (action == HISTORY_CLEAR) {
+    clear_history();
+  }
+  else if (action == HISTORY_READ) {
+    if(read_history(history_file) != 0) {
+      perror("read_history");
+    }
+  }
+  else if (action == HISTORY_WRITE) {
+    if(write_history(history_file) != 0) {
+      perror("write_history");
+    }
+  }
+  else if (action == HISTORY_APPEND) {
+    if(append_history(history_length, history_file) != 0) {
+      perror("append_history");
+    }
+  }
+  else {
+    register HIST_ENTRY **the_list;
+    register int i;
+    int start_index;
+
+    the_list = history_list();
+    
+    if (the_list) {
+      if (num_of_entries == 0) {
+        for (i = 0; the_list[i]; i++) {
+          printf ("    %d  %s\n", i + history_base, the_list[i]->line);
+        }
+      }
+      else {
+        start_index = max(0, history_length - num_of_entries);
+        for (i = start_index; the_list[i]; i++) {
+          printf ("    %d  %s\n", i + history_base, the_list[i]->line);
+        }
+      }
+    }
+  }
+  
 }
 
 char* search_path(const char *cmd) {
@@ -977,93 +1112,111 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
   return 0;
 }
 
-int pipeline_executor(ParsedCommand commands[], size_t command_capacity) {
-  int writer_status, reader_status;
-  int writer_forked = 0;
-  int reader_forked = 0;
+int pipeline_executor(ParsedCommand commands[], size_t command_count) {
+  int child_status;
+  int prev_pipe_read = 0;
+  int exit_code = 0;
   int pipe_fd[2];
-  pid_t writer_pid, reader_pid;
 
-  if (pipe(pipe_fd) == -1) {
-    perror("pipe");
-    return -1;
-  }
+  pid_t commands_pid[command_count];
 
-  for(size_t i; i < command_capacity; i++) {
-
-    if (writer_forked & reader_forked) {
-      waitpid(writer_pid, &writer_status, 0);
-      waitpid(reader_pid, &reader_status, 0);
-    }
-    
-    if (i % 2 == 0) {
-      writer_pid = fork();
-      if (writer_pid == -1){
-        perror("fork");
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
+  for(size_t i = 0; i < command_count; i++) {
+  
+    if (i == 0) {
+      if(pipe(pipe_fd) == -1) {
+        perror("pipe");
         return -1;
       }
-      writer_forked = 1;
-      if (writer_pid == 0) {
+      
+      commands_pid[i] = fork();
+      if (commands_pid[i] == -1){
+        perror("fork");
+        return -1;
+      }
+      
+      if (commands_pid[i] == 0) {
         close(pipe_fd[0]);
-        dup2(pipe_fd[1], STDOUT_FILENO);
+        if (dup2(pipe_fd[1], STDOUT_FILENO) == -1) {
+          fprintf(stderr, "Failed to duplicate.\n");
+          _exit(1);
+        }
         close(pipe_fd[1]);
 
         int executed_state = execute_command(commands[i]);
         exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
       }
+      close(pipe_fd[1]);
+      prev_pipe_read = pipe_fd[0];
     }
-    else if (i % 2 != 0 && i != command_capacity - 1) {
-      reader_pid = fork();
-      reader_forked = 1;
-      if (reader_pid == -1){
+    else if (i == command_count - 1) {
+      commands_pid[i] = fork();
+      if (commands_pid[i] == -1){
         perror("fork");
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
         return -1;
       }
 
-      if (reader_pid == 0) {
+      if (commands_pid[i] == 0) {
         close(pipe_fd[1]);
-        dup2(pipe_fd[0], STDIN_FILENO);
+        if (dup2(pipe_fd[0], STDIN_FILENO) == -1) {
+          fprintf(stderr, "Failed to duplicate.\n");
+          _exit(1);
+        }
         close(pipe_fd[0]);
         
         int executed_state = execute_command(commands[i]);
         exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
       }
     }
-
-    if (i == command_capacity - 1) {
-      reader_pid = fork();
-      if (reader_pid == -1){
+    else {
+      
+      if(pipe(pipe_fd) == -1) {
+        perror("pipe");
+        return -1;
+      }
+      
+      commands_pid[i] = fork();
+      if (commands_pid[i] == -1){
         perror("fork");
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
         return -1;
       }
 
-      if (reader_pid == 0) {
-        close(pipe_fd[1]);
-        dup2(pipe_fd[0], STDIN_FILENO);
+      if (commands_pid[i] == 0) {
+        if (dup2(prev_pipe_read, STDIN_FILENO) == -1) {
+          fprintf(stderr, "Failed to duplicate.\n");
+          _exit(1);
+        }
+        close(prev_pipe_read);
+
         close(pipe_fd[0]);
+        if (dup2(pipe_fd[1], STDOUT_FILENO) == -1) {
+          fprintf(stderr, "Failed to duplicate.\n");
+          _exit(1);
+        }
+        close(pipe_fd[1]);
         
         int executed_state = execute_command(commands[i]);
-        exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
+        exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS); 
       }
-    }
 
-    close(pipe_fd[0]);
-    close(pipe_fd[1]);
+      close(pipe_fd[1]);
+      close(prev_pipe_read);
+      prev_pipe_read = pipe_fd[0];
+      
+    }
   }
 
   close(pipe_fd[0]);
   close(pipe_fd[1]);
 
-  waitpid(writer_pid, &writer_status, 0);
-  waitpid(reader_pid, &reader_status, 0);
+  for(size_t i = 0; i < command_count; i++) {
+    if( waitpid(commands_pid[i], &child_status, 0) == -1 ) {
+      exit_code = -1;
+      perror("waitpid failed");
+      continue;
+    }
+  }
 
-  return 0;
+  return exit_code;
 }
 
 void free_tokens(Token tokens[], size_t token_count) {
