@@ -88,6 +88,7 @@ static const char *builtin_commands[] = {
 };
 
 Builtin type_command(const char *cmd);
+char* get_history_env();
 int tokenize(const char *input, Token tokens[], size_t capacity);
 int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands[], size_t command_capacity);
 int execute_command(ParsedCommand command, int *history_pending_counter);
@@ -102,7 +103,6 @@ void type_builtin(const char *cmd);
 void pwd_builtin();
 void cd_builtin(const char *path);
 void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file, int *history_pending_counter);
-char* get_history_env();
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
 void run_program(char *argv[]);
@@ -114,11 +114,17 @@ int pipeline_executor(ParsedCommand commands[], size_t command_capacity, int *hi
 void free_tokens(Token tokens[], size_t token_count);
 
 int main(void) {
+  char *history_env_path = NULL;
   int history_pending_counter = 0;
   setbuf(stdout, NULL);
 
   rl_attempted_completion_function = shell_completion;
   using_history();
+
+  history_env_path = get_history_env();
+  if (history_env_path != NULL && history_env_path[0] != '\0') {
+    read_history(history_env_path);
+  }
   
   while (1) {  
     int token_count, executed_state;
@@ -130,7 +136,6 @@ int main(void) {
     size_t command_capacity = 1;
     
     fflush(stdout);
-
     input = readline("$ ");
     if(input == NULL) {
       break;
@@ -206,8 +211,28 @@ int main(void) {
     }
 
   }
+
+  if (history_env_path != NULL && history_env_path[0] != '\0') {
+    int error = write_history(history_env_path);
+
+    if (error != 0) {
+      fprintf(stderr, "history: cannot save %s: %s\n", history_env_path, strerror(error));
+    }
+  }
+
+  free(history_env_path);
   
   return 0;
+}
+
+char* get_history_env() {
+  const char *history_env_path;
+  history_env_path = getenv("HISTFILE");
+
+  if (history_env_path != NULL || history_env_path[0] != '\0') {
+    return NULL;
+  }
+  return strdup(history_env_path);
 }
 
 int tokenize(const char *input, Token tokens[], size_t capacity) {
@@ -977,18 +1002,7 @@ void history_builtin(enum HistoryAction action, int num_of_entries, const char *
       }
     }
   }
-  free(history_env_path);
-}
-
-char* get_history_env() {
-  const char *history_env_path;
-  history_env_path = getenv("HISTFILE");
   
-  if (history_env_path == NULL) {
-    history_env_path = "~/.bash_history";
-  }
-
-  return strdup(history_env_path);
 }
 
 char* search_path(const char *cmd) {
