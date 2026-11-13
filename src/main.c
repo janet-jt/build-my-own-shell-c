@@ -90,7 +90,7 @@ static const char *builtin_commands[] = {
 Builtin type_command(const char *cmd);
 int tokenize(const char *input, Token tokens[], size_t capacity);
 int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands[], size_t command_capacity);
-int execute_command(ParsedCommand command);
+int execute_command(ParsedCommand command, int *history_pending_counter);
 static int is_first_command(int start);
 char **shell_completion(const char *input, int start, int end);
 char* dir_discovery();
@@ -101,7 +101,8 @@ void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
 void pwd_builtin();
 void cd_builtin(const char *path);
-void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file);
+void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file, int *history_pending_counter);
+char* get_history_env();
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
 void run_program(char *argv[]);
@@ -109,13 +110,15 @@ int std_redirection(enum redirection_mode stdout_redirect_mode,
                     enum redirection_mode stderr_redirect_mode, 
                     const char *stdout_output_file, 
                     const char *stderr_output_file);
-int pipeline_executor(ParsedCommand commands[], size_t command_capacity);
+int pipeline_executor(ParsedCommand commands[], size_t command_capacity, int *history_pending_counter);
 void free_tokens(Token tokens[], size_t token_count);
 
 int main(void) {
+  int history_pending_counter = 0;
   setbuf(stdout, NULL);
 
   rl_attempted_completion_function = shell_completion;
+  using_history();
   
   while (1) {  
     int token_count, executed_state;
@@ -123,6 +126,7 @@ int main(void) {
     int stdin_fd = dup(STDIN_FILENO);
     int stdout_fd = dup(STDOUT_FILENO);
     int stderr_fd = dup(STDERR_FILENO);
+    
     size_t command_capacity = 1;
     
     fflush(stdout);
@@ -138,6 +142,7 @@ int main(void) {
     }
 
     add_history(input);
+    history_pending_counter++;
 
     Token tokens[INPUT_SIZE];
     
@@ -169,9 +174,9 @@ int main(void) {
     }
 
     if (command_count > 1) {
-      executed_state = pipeline_executor(commands, (size_t)command_capacity);
+      executed_state = pipeline_executor(commands, (size_t)command_capacity, &history_pending_counter);
     } else {
-      executed_state = execute_command(commands[0]);
+      executed_state = execute_command(commands[0], &history_pending_counter);
     }    
 
     if (executed_state == 1) {
@@ -516,7 +521,7 @@ int parse_token(const Token tokens[], size_t token_count, ParsedCommand commands
   return current_index + 1;
 }
 
-int execute_command(ParsedCommand command) {
+int execute_command(ParsedCommand command, int *history_pending_counter) {
   if (command.stdout_output_file != NULL || command.stderr_output_file != NULL) {
     std_redirection(command.stdout_mode, command.stderr_mode, command.stdout_output_file, command.stderr_output_file);
   }
@@ -574,11 +579,11 @@ int execute_command(ParsedCommand command) {
 
         number_of_entries = (int)val;
         action = HISTORY_DISPLAY;
-        history_builtin(action, number_of_entries, history_file);
+        history_builtin(action, number_of_entries, history_file, history_pending_counter);
       } else {
         if (strncmp(command.argv[1], "-c" , 2) == 0 && strlen(command.argv[1]) == 2) {
           action = HISTORY_CLEAR;
-          history_builtin(action, number_of_entries, history_file);
+          history_builtin(action, number_of_entries, history_file, history_pending_counter);
         }
       }   
     }
@@ -589,22 +594,22 @@ int execute_command(ParsedCommand command) {
       }
       else if (strncmp(command.argv[1], "-c" , 2) == 0 && strlen(command.argv[1]) == 2) {
           action = HISTORY_CLEAR;
-          history_builtin(action, number_of_entries, history_file);
+          history_builtin(action, number_of_entries, history_file, history_pending_counter);
       }
       else if (strncmp(command.argv[1], "-r" , 2) == 0 && strlen(command.argv[1]) == 2) {
         action = HISTORY_READ;
         history_file = command.argv[2];
-        history_builtin(action, number_of_entries, history_file);
+        history_builtin(action, number_of_entries, history_file, history_pending_counter);
       }
       else if (strncmp(command.argv[1], "-w" , 2) == 0 && strlen(command.argv[1]) == 2) {
         action = HISTORY_WRITE;
         history_file = command.argv[2];
-        history_builtin(action, number_of_entries, history_file);
+        history_builtin(action, number_of_entries, history_file, history_pending_counter);
       }
       else if (strncmp(command.argv[1], "-a" , 2) == 0 && strlen(command.argv[1]) == 2) {
         action = HISTORY_APPEND;
         history_file = command.argv[2];
-        history_builtin(action, number_of_entries, history_file);
+        history_builtin(action, number_of_entries, history_file, history_pending_counter);
       }
       else {
         fprintf(stderr, "history: unknown options\n");
@@ -614,7 +619,7 @@ int execute_command(ParsedCommand command) {
     }
     else {
       action = HISTORY_DISPLAY;
-      history_builtin(action, number_of_entries, history_file);
+      history_builtin(action, number_of_entries, history_file, history_pending_counter);
     }
 
   }
@@ -931,24 +936,26 @@ void cd_builtin(const char *path) {
   free(cd_path);
 }
 
-void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file) {
+void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file, int *history_pending_counter) {
+
   if (action == HISTORY_CLEAR) {
     clear_history();
   }
   else if (action == HISTORY_READ) {
     if(read_history(history_file) != 0) {
-      perror("read_history");
+      perror("history");
     }
   }
-  else if (action == HISTORY_WRITE) {
+  else if (action == HISTORY_WRITE) { 
     if(write_history(history_file) != 0) {
-      perror("write_history");
+      perror("history");
     }
   }
   else if (action == HISTORY_APPEND) {
-    if(append_history(history_length, history_file) != 0) {
-      perror("append_history");
+    if(append_history((*history_pending_counter), history_file) != 0) {
+      perror("history");
     }
+    (*history_pending_counter) = 0;
   }
   else {
     register HIST_ENTRY **the_list;
@@ -956,7 +963,6 @@ void history_builtin(enum HistoryAction action, int num_of_entries, const char *
     int start_index;
 
     the_list = history_list();
-    
     if (the_list) {
       if (num_of_entries == 0) {
         for (i = 0; the_list[i]; i++) {
@@ -971,7 +977,18 @@ void history_builtin(enum HistoryAction action, int num_of_entries, const char *
       }
     }
   }
+  free(history_env_path);
+}
+
+char* get_history_env() {
+  const char *history_env_path;
+  history_env_path = getenv("HISTFILE");
   
+  if (history_env_path == NULL) {
+    history_env_path = "~/.bash_history";
+  }
+
+  return strdup(history_env_path);
 }
 
 char* search_path(const char *cmd) {
@@ -1112,7 +1129,7 @@ int std_redirection(enum redirection_mode stdout_redirect_mode, enum redirection
   return 0;
 }
 
-int pipeline_executor(ParsedCommand commands[], size_t command_count) {
+int pipeline_executor(ParsedCommand commands[], size_t command_count, int *history_pending_counter) {
   int child_status;
   int prev_pipe_read = 0;
   int exit_code = 0;
@@ -1142,7 +1159,7 @@ int pipeline_executor(ParsedCommand commands[], size_t command_count) {
         }
         close(pipe_fd[1]);
 
-        int executed_state = execute_command(commands[i]);
+        int executed_state = execute_command(commands[i], history_pending_counter);
         exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
       }
       close(pipe_fd[1]);
@@ -1163,7 +1180,7 @@ int pipeline_executor(ParsedCommand commands[], size_t command_count) {
         }
         close(pipe_fd[0]);
         
-        int executed_state = execute_command(commands[i]);
+        int executed_state = execute_command(commands[i], history_pending_counter);
         exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS);
       }
     }
@@ -1194,7 +1211,7 @@ int pipeline_executor(ParsedCommand commands[], size_t command_count) {
         }
         close(pipe_fd[1]);
         
-        int executed_state = execute_command(commands[i]);
+        int executed_state = execute_command(commands[i], history_pending_counter);
         exit(executed_state == -1 ? EXIT_FAILURE : EXIT_SUCCESS); 
       }
 
