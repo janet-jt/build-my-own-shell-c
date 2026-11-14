@@ -32,6 +32,7 @@ typedef enum {
   BUILTIN_PWD,
   BUILTIN_CD,
   BUILTIN_HISTORY,
+  BUILTIN_JOBS,
   BUILTIN_UNKNOWN
 } Builtin;
 
@@ -84,6 +85,7 @@ static const char *builtin_commands[] = {
   "exit",
   "type",
   "history",
+  "jobs",
   NULL
 };
 
@@ -102,6 +104,7 @@ void echo_builtin(int argc, char *argv[]);
 void type_builtin(const char *cmd);
 void pwd_builtin();
 void cd_builtin(const char *path);
+void jobs_builtin();
 void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file, int *history_pending_counter);
 char* search_path(const char *full_path);
 void print_command_location(const char *cmd);
@@ -122,11 +125,11 @@ int main(void) {
   using_history();
 
   history_env_path = get_history_env();
-  if (history_env_path != NULL && history_env_path[0] != '\0') {
+  if (history_env_path != NULL) {
     read_history(history_env_path);
   }
   
-  while (1) {  
+  while (1) {
     int token_count, executed_state;
     char *input;
     int stdin_fd = dup(STDIN_FILENO);
@@ -185,6 +188,15 @@ int main(void) {
     }    
 
     if (executed_state == 1) {
+      if (history_env_path != NULL && history_env_path[0] != '\0') {
+        int error = write_history(history_env_path);
+
+        if (error != 0) {
+          fprintf(stderr, "history: cannot save %s: %s\n", history_env_path, strerror(error));
+        }
+      }
+
+      free(history_env_path);
       free_tokens(tokens, token_count);
       break;
     }
@@ -212,15 +224,6 @@ int main(void) {
 
   }
 
-  if (history_env_path != NULL && history_env_path[0] != '\0') {
-    int error = write_history(history_env_path);
-
-    if (error != 0) {
-      fprintf(stderr, "history: cannot save %s: %s\n", history_env_path, strerror(error));
-    }
-  }
-
-  free(history_env_path);
   
   return 0;
 }
@@ -229,7 +232,7 @@ char* get_history_env() {
   const char *history_env_path;
   history_env_path = getenv("HISTFILE");
 
-  if (history_env_path != NULL || history_env_path[0] != '\0') {
+  if (history_env_path == NULL || history_env_path[0] == '\0') {
     return NULL;
   }
   return strdup(history_env_path);
@@ -558,11 +561,14 @@ int execute_command(ParsedCommand command, int *history_pending_counter) {
     echo_builtin(command.argc, command.argv);
   }
   else if (strncmp(command.argv[0], "type" , 4) == 0 && strlen(command.argv[0]) == 4) {
-    if (command.argc == 1) {
-      printf("usage: type command\n");
-    } else {
+    if (command.argc != 1) {
       type_builtin(command.argv[1]);
-    }
+    } 
+  }
+  else if (strncmp(command.argv[0], "jobs" , 4) == 0 && strlen(command.argv[0]) == 4) {
+    if (command.argc != 1) {
+      jobs_builtin();
+    } 
   }
   else if (strncmp(command.argv[0], "pwd", 3) == 0 && strlen(command.argv[0]) == 3) {
     pwd_builtin();
@@ -580,39 +586,32 @@ int execute_command(ParsedCommand command, int *history_pending_counter) {
     enum HistoryAction action;
     int number_of_entries = 0;
     const char *history_file = NULL;
-    if (command.argc == 2) {
-      if (strncmp(command.argv[1], "-" , 1) != 0) {
-        const char *arg = command.argv[1];
-        char *endptr;
+    if (command.argc == 2 && strncmp(command.argv[1], "-" , 1) != 0) {
+      const char *arg = command.argv[1];
+      char *endptr;
 
-        errno = 0;
-        long val = strtol(arg, &endptr, 10);
+      errno = 0;
+      long val = strtol(arg, &endptr, 10);
 
-        if (endptr == arg || *endptr != '\0') {
-          fprintf(stderr,
-                  "history: %s: numeric argument required\n",
-                  arg);
-          return -1;
-        }
+      if (endptr == arg || *endptr != '\0') {
+        fprintf(stderr, "history: %s: numeric argument required\n", arg);
+        return -1;
+      }
 
-        if (errno == ERANGE || val < 0 || val > INT_MAX) {
-          fprintf(stderr,
-                  "history: %s: count must be between 0 and %d\n",
-                  arg, INT_MAX);
-          return -1;
-        }
+      if (errno == ERANGE || val < 0 || val > INT_MAX) {
+        fprintf(stderr, "history: %s: count must be between 0 and %d\n", arg, INT_MAX);
+        return -1;
+      }
 
-        number_of_entries = (int)val;
-        action = HISTORY_DISPLAY;
-        history_builtin(action, number_of_entries, history_file, history_pending_counter);
-      } else {
-        if (strncmp(command.argv[1], "-c" , 2) == 0 && strlen(command.argv[1]) == 2) {
-          action = HISTORY_CLEAR;
-          history_builtin(action, number_of_entries, history_file, history_pending_counter);
-        }
-      }   
+      number_of_entries = (int)val;
+      action = HISTORY_DISPLAY;
+      history_builtin(action, number_of_entries, history_file, history_pending_counter);
     }
-    else if (command.argc > 2) {
+    else if (command.argc >= 2) {
+      char *history_env_path = get_history_env();
+      if (command.argc == 2 && history_env_path != NULL) {
+        history_file = history_env_path;
+      }
       if (strncmp(command.argv[1], "-" , 1) != 0) {
         fprintf(stderr, "history: too many arguments\n");
         return -1;
@@ -640,7 +639,7 @@ int execute_command(ParsedCommand command, int *history_pending_counter) {
         fprintf(stderr, "history: unknown options\n");
         return -1;
       }
-      
+      free(history_env_path);
     }
     else {
       action = HISTORY_DISPLAY;
@@ -881,6 +880,7 @@ Builtin type_command(const char *cmd) {
   if (strncmp(cmd, "pwd", 3) == 0 && strlen(cmd) == 3) return BUILTIN_PWD;
   if (strncmp(cmd, "cd", 2) == 0 && strlen(cmd) == 2) return BUILTIN_CD;
   if (strncmp(cmd, "history", 7) == 0 && strlen(cmd) == 7) return BUILTIN_HISTORY;
+  if (strncmp(cmd, "jobs", 4) == 0 && strlen(cmd) == 4) return BUILTIN_JOBS;
   return BUILTIN_UNKNOWN;
 }
 
@@ -902,6 +902,7 @@ void type_builtin(const char *cmd) {
     case BUILTIN_PWD:
     case BUILTIN_CD:
     case BUILTIN_HISTORY:
+    case BUILTIN_JOBS:
       printf("%s is a shell builtin\n", cmd);
       break;
     case BUILTIN_UNKNOWN:
@@ -959,6 +960,10 @@ void cd_builtin(const char *path) {
     return;
   }
   free(cd_path);
+}
+
+void jobs_builtin() {
+  printf("this is jobs builtin.\n");
 }
 
 void history_builtin(enum HistoryAction action, int num_of_entries, const char *history_file, int *history_pending_counter) {
